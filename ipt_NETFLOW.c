@@ -51,6 +51,9 @@
 #include <net/dst.h>
 #include <linux/netfilter_ipv4/ip_tables.h>
 #include <linux/netfilter_bridge.h>
+#ifdef CONFIG_NF_TABLES
+#include <linux/netfilter/nf_tables.h>
+#endif
 #ifndef ENABLE_NAT
 # undef CONFIG_NF_NAT_NEEDED
 #endif
@@ -97,6 +100,7 @@ MODULE_AUTHOR("<abc@openwall.com>");
 MODULE_DESCRIPTION("iptables NETFLOW target module");
 MODULE_VERSION(IPT_NETFLOW_VERSION);
 MODULE_ALIAS("ip6t_NETFLOW");
+MODULE_ALIAS("nft_NETFLOW");
 
 static char version_string[128];
 static int  version_string_size;
@@ -2928,7 +2932,7 @@ static struct base_template template_mpls = {
 	.types = {
 		mplsTopLabelTTL,
 		/* do not just add element here, becasue this array
-		 * is truncated in ipt_netflow_init() */
+		 * is truncated in ipt_netflow_module_init() */
 #define MPLS_LABELS_BASE_INDEX 1
 		MPLS_LABEL_1,
 		MPLS_LABEL_2,
@@ -4877,55 +4881,26 @@ static void parse_l2_header(const struct sk_buff *skb, struct ipt_netflow_tuple 
 
 /* packet receiver */
 static unsigned int netflow_target(
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-			   struct sk_buff **pskb,
-#else
-			   struct sk_buff *skb,
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
-			   const struct net_device *if_in,
-			   const struct net_device *if_out,
-			   unsigned int hooknum,
-# if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,17)
-			   const struct xt_target *target,
-# endif
-# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19)
-			   const void *targinfo,
-			   void *userinfo
-# else
-			   const void *targinfo
-# endif
-#else /* since 2.6.28 */
-# define if_in  xt_in(par)
-# define if_out xt_out(par)
-# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
-			   const struct xt_target_param *par
-# else
-			   const struct xt_action_param *par
-# endif
-#endif
-		)
-{
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-# ifndef ENABLE_L2
+#ifndef ENABLE_L2
 	/* pskb_may_pull() may modify skb */
 	const
-# endif
-		struct sk_buff *skb = *pskb;
 #endif
+			struct sk_buff *skb,
+#ifdef ENABLE_DIRECTION
+	const int hooknum,
+#else
+	const int family,
+#endif
+#define if_in ifs[0]
+#define if_out ifs[1]
+	const struct net_device **ifs
+		)
+{
 	union {
 		struct iphdr ip;
 		struct ipv6hdr ip6;
 	} _iph, *iph;
 	u_int32_t hash;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
-	const int family = target->family;
-#else
-# ifdef ENABLE_DIRECTION
-	const int hooknum = xt_hooknum(par);
-# endif
-	const int family = xt_family(par);
-#endif
 	struct ipt_netflow_tuple tuple;
 	struct ipt_netflow *nf;
 	__u8 tcp_flags;
@@ -5344,6 +5319,53 @@ unlock_return:
 
 	return IPT_CONTINUE;
 }
+#undef if_in
+#undef if_out
+
+static unsigned int ipt_netflow_target(
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
+			   struct sk_buff **pskb,
+#else
+			   struct sk_buff *skb,
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
+			   const struct net_device *if_in,
+			   const struct net_device *if_out,
+			   unsigned int hooknum,
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,17)
+			   const struct xt_target *target,
+# endif
+# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19)
+			   const void *targinfo,
+			   void *userinfo
+# else
+			   const void *targinfo
+# endif
+#else /* since 2.6.28 */
+# if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)
+			   const struct xt_target_param *par
+# else
+			   const struct xt_action_param *par
+# endif
+#endif
+		)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,28)
+	const int family = target->family;
+#else
+# define if_in  xt_in(par)
+# define if_out xt_out(par)
+# ifdef ENABLE_DIRECTION
+	const int family = xt_hooknum(par);
+# endif
+	const int family = xt_family(par);
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
+		struct sk_buff *skb = *pskb;
+#endif
+	const struct net_device *ifs[2] = {if_in, if_out};
+	return netflow_target(skb, family, ifs);
+}
 
 #ifdef CONFIG_NF_NAT_NEEDED
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,31)
@@ -5463,10 +5485,52 @@ static void unregister_ct_events(void)
 }
 #endif /* CONFIG_NF_NAT_NEEDED */
 
+#ifdef CONFIG_NF_TABLES
+static void nft_netflow_eval(const struct nft_expr *expr, 
+							struct nft_regs *regs, 
+							const struct nft_pktinfo *pkt) {
+	
+	struct sk_buff *skb = pkt->skb;
+#ifdef ENABLE_DIRECTION
+	const int family = nft_hook(pkt);
+#else
+	const int family = nft_pf(pkt);
+#endif
+	const struct net_device *ifs[2] = {nft_in(pkt), nft_out(pkt)};
+	netflow_target(skb, family, ifs);
+	regs->verdict.code = NFT_CONTINUE;
+}
+
+int nft_reject_validate(const struct nft_ctx *ctx,
+			const struct nft_expr *expr,
+			const struct nft_data **data)
+{
+	return nft_chain_validate_hooks(ctx->chain,
+					(1 << NF_INET_FORWARD));
+}
+
+static struct nft_expr_type nft_netflow_type;
+static const struct nft_expr_ops nft_netflow_op = {
+	.eval = nft_netflow_eval,
+	//.size = sizeof(struct nft_netflow),
+	.size = 0,
+	//.init = nft_netflow_init,
+	//.dump = nft_netflow_dump,
+	.type = &nft_netflow_type,
+	.validate = nft_netflow_validate,
+};
+static struct nft_expr_type nft_netflow_type __read_mostly =  {
+	.family	= NFPROTO_INET,
+	.ops = &nft_netflow_op,
+	.name = "netflow",
+	.owner = THIS_MODULE,
+};
+#endif /* CONFIG_NF_TABLES */
+
 static struct ipt_target ipt_netflow_reg[] __read_mostly = {
 	{
 		.name		= "NETFLOW",
-		.target		= netflow_target,
+		.target		= ipt_netflow_target,
 		.checkentry	= netflow_target_check,
 		.family		= AF_INET,
 		.hooks		=
@@ -5479,7 +5543,7 @@ static struct ipt_target ipt_netflow_reg[] __read_mostly = {
 	},
 	{
 		.name		= "NETFLOW",
-		.target		= netflow_target,
+		.target		= ipt_netflow_target,
 		.checkentry	= netflow_target_check,
 		.family		= AF_INET6,
 		.hooks		=
@@ -5521,7 +5585,7 @@ static int register_stat(const char *name, struct file_operations *fops)
 # define register_stat(x, y) 1
 #endif
 
-static int __init ipt_netflow_init(void)
+static int __init ipt_netflow_module_init(void)
 {
 	int i;
 
@@ -5664,6 +5728,13 @@ static int __init ipt_netflow_init(void)
 	peakflows_at = jiffies;
 	if (xt_register_targets(ipt_netflow_reg, ARRAY_SIZE(ipt_netflow_reg)))
 		goto err_stop_timer;
+#ifdef CONFIG_NF_TABLES
+	if (nft_register_expr(&nft_netflow_type)) {
+		xt_unregister_targets(ipt_netflow_reg, ARRAY_SIZE(ipt_netflow_reg));
+		goto err_stop_timer;
+	}
+	
+#endif
 
 #ifdef CONFIG_NF_NAT_NEEDED
 	if (natevents)
@@ -5704,7 +5775,7 @@ err:
 	return -ENOMEM;
 }
 
-static void __exit ipt_netflow_fini(void)
+static void __exit ipt_netflow_module_fini(void)
 {
 	printk(KERN_INFO "ipt_NETFLOW unloading..\n");
 
@@ -5720,6 +5791,9 @@ static void __exit ipt_netflow_fini(void)
 	switch_promisc(0);
 #endif
 	xt_unregister_targets(ipt_netflow_reg, ARRAY_SIZE(ipt_netflow_reg));
+#ifdef CONFIG_NF_TABLES
+	nft_unregister_expr(&nft_netflow_type);
+#endif
 #ifdef CONFIG_NF_NAT_NEEDED
 	if (natevents)
 		unregister_ct_events();
@@ -5750,7 +5824,7 @@ static void __exit ipt_netflow_fini(void)
 	printk(KERN_INFO "ipt_NETFLOW unloaded.\n");
 }
 
-module_init(ipt_netflow_init);
-module_exit(ipt_netflow_fini);
+module_init(ipt_netflow_module_init);
+module_exit(ipt_netflow_module_fini);
 
 /* vim: set sw=8: */
